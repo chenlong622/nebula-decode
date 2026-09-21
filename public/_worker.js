@@ -1405,95 +1405,126 @@ async function renderPanel(url, request, cfg, env) {
   const clashURL = url.origin + base + '/sub?target=clash';
   const singboxURL = url.origin + base + '/sub?target=singbox';
   const protoBadges =
-    (cfg.enableVless ? '<span class="badge ok">VLESS-WS</span>' : '<span class="badge off">VLESS 关</span>') +
-    (cfg.enableTrojan && cfg.trojanPassword ? '<span class="badge ok">TROJAN-WS</span>' : '<span class="badge off">TROJAN 关</span>') +
-    (cfg.path ? '<span class="badge">自定义路径</span>' : '');
+    (cfg.enableVless ? '<span class="pill"><span class="dot"></span>VLESS-WS</span>' : '<span class="pill"><span class="dot off"></span>VLESS 关</span>') +
+    (cfg.enableTrojan && cfg.trojanPassword ? '<span class="pill"><span class="dot"></span>TROJAN-WS</span>' : '<span class="pill"><span class="dot off"></span>TROJAN 关</span>') +
+    (cfg.path ? '<span class="pill">自定义路径</span>' : '');
+
+  const logoSvg = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none">' +
+'<circle cx="12" cy="12" r="3.1" fill="#5eead4"/>' +
+'<ellipse cx="12" cy="12" rx="10" ry="4.3" stroke="#818cf8" stroke-width="1.2" opacity=".9"/>' +
+'<ellipse cx="12" cy="12" rx="10" ry="4.3" stroke="#5eead4" stroke-width="1.2" opacity=".55" transform="rotate(62 12 12)"/>' +
+'<ellipse cx="12" cy="12" rx="10" ry="4.3" stroke="#5eead4" stroke-width="1.2" opacity=".3" transform="rotate(118 12 12)"/>' +
+'</svg>';
 
   const html = '<!DOCTYPE html>' +
 '<html lang="zh-CN"><head><meta charset="utf-8">' +
 '<meta name="viewport" content="width=device-width,initial-scale=1">' +
 '<title>NEBULA-DECODE 终端</title><style>' +
 '*{box-sizing:border-box;margin:0;padding:0}' +
-'body{background:#0a0e14;color:#c9d1d9;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:14px;line-height:1.6;padding:24px}' +
-'.wrap{max-width:860px;margin:0 auto}' +
-'h1{color:#58e6d9;font-size:20px;letter-spacing:2px;margin-bottom:4px}' +
-'h1 .v{color:#4a5568;font-size:12px}' +
-'.sub{color:#4a5568;font-size:12px;margin-bottom:20px}' +
-'.badge{display:inline-block;background:#161b22;border:1px solid #30363d;border-radius:4px;padding:1px 8px;font-size:11px;margin-right:6px;color:#8b949e}' +
-'.badge.ok{color:#58e6d9;border-color:#1f6f64}' +
-'.badge.off{color:#f85149;border-color:#7d2b28}' +
-'.card{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:16px 18px;margin-bottom:16px}' +
-'.card h2{font-size:13px;color:#58e6d9;letter-spacing:1px;margin-bottom:12px;border-bottom:1px solid #21262d;padding-bottom:8px}' +
-'label{display:block;color:#8b949e;font-size:12px;margin:10px 0 4px}' +
-'input[type=text],input[type=password],textarea{width:100%;background:#010409;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;padding:8px 10px;font-family:inherit;font-size:13px}' +
-'input:focus,textarea:focus{outline:none;border-color:#1f6f64}' +
-'textarea{resize:vertical;min-height:70px}' +
-'button{background:#1158c7;border:none;color:#fff;border-radius:6px;padding:7px 14px;font-family:inherit;font-size:13px;cursor:pointer;margin:10px 8px 0 0}' +
-'button:hover{background:#1a6ae0}' +
-'button.ghost{background:#21262d;color:#c9d1d9}' +
-'button.ghost:hover{background:#30363d}' +
-'button.danger{background:#7d2b28}' +
-'code,a.code{display:block;background:#010409;border:1px solid #30363d;border-radius:6px;padding:8px 10px;color:#8dd3a0;font-size:12px;word-break:break-all;margin:6px 0;text-decoration:none}' +
-'a.code:hover{border-color:#1f6f64}' +
-'.chk{margin:8px 16px 0 0;color:#c9d1d9;font-size:13px;cursor:pointer}' +
-'.row{display:flex;gap:12px;flex-wrap:wrap}.row>div{flex:1;min-width:220px}' +
-'.msg{margin-top:8px;font-size:12px;color:#58e6d9;min-height:18px}' +
-'.hint{color:#4a5568;font-size:12px;margin-top:10px}' +
-'.brand{color:#f0883e;border:1px solid #7d4e1e;border-radius:4px;padding:1px 8px;font-size:12px;margin-left:10px;vertical-align:2px}' +
-'.footer{color:#4a5568;font-size:12px;text-align:center;margin:18px 0 4px}' +
-'.footer a{color:#58e6d9;text-decoration:none}' +
+':root{--fg:#e6edf3;--mut:#94a3b8;--dim:#64748b;--ac:#5eead4;--line:rgba(148,163,184,.14);--sur:rgba(148,163,184,.05)}' +
+'body{background:#05080f;color:var(--fg);font:14px/1.65 "Segoe UI",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;min-height:100vh;background-image:radial-gradient(1100px 520px at 12% -8%,rgba(45,212,191,.12),transparent 60%),radial-gradient(900px 480px at 88% 112%,rgba(129,140,248,.11),transparent 60%);background-attachment:fixed}' +
+'::selection{background:rgba(94,234,212,.25)}' +
+'::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:rgba(148,163,184,.22);border-radius:6px}::-webkit-scrollbar-track{background:transparent}' +
+'.wrap{max-width:940px;margin:0 auto;padding:36px 22px 40px}' +
+'.hero{display:flex;align-items:center;gap:16px;flex-wrap:wrap}' +
+'.mark{width:46px;height:46px;flex:none;border-radius:14px;display:grid;place-items:center;background:linear-gradient(135deg,rgba(94,234,212,.14),rgba(129,140,248,.14));border:1px solid rgba(94,234,212,.3);box-shadow:0 0 26px rgba(45,212,191,.16)}' +
+'h1{font-size:23px;font-weight:700;letter-spacing:3px;background:linear-gradient(92deg,#eafffb 0%,#5eead4 48%,#818cf8 100%);-webkit-background-clip:text;background-clip:text;color:transparent}' +
+'h1 .v{font-size:12px;font-weight:500;letter-spacing:1px;color:var(--dim);-webkit-text-fill-color:var(--dim);margin-left:8px;vertical-align:4px}' +
+'.brand{color:#fbbf77;border:1px solid rgba(251,191,119,.32);background:rgba(251,191,119,.06);border-radius:999px;padding:4px 13px;font-size:12px;letter-spacing:1px}' +
+'.status{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0 26px}' +
+'.pill{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);background:var(--sur);border-radius:999px;padding:4px 13px;font-size:12px;color:var(--mut)}' +
+'.pill b{color:var(--fg);font-weight:600;font-family:ui-monospace,Consolas,monospace}' +
+'.dot{width:7px;height:7px;border-radius:50%;background:#5eead4;box-shadow:0 0 8px rgba(94,234,212,.9);flex:none}' +
+'.dot.off{background:#f87171;box-shadow:0 0 8px rgba(248,113,113,.8)}' +
+'.card{background:var(--sur);border:1px solid var(--line);border-radius:16px;padding:22px 24px;margin-bottom:18px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);box-shadow:0 20px 44px -26px rgba(0,0,0,.7);animation:rise .45s ease both}' +
+'@keyframes rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}' +
+'.card h2{display:flex;align-items:center;gap:10px;font-size:14px;font-weight:600;letter-spacing:2px;margin-bottom:6px;padding-bottom:12px;border-bottom:1px solid var(--line)}' +
+'.card h2 .no{color:var(--ac);font:600 11px/1 ui-monospace,Consolas,monospace;border:1px solid rgba(94,234,212,.3);border-radius:6px;padding:4px 7px;background:rgba(94,234,212,.06)}' +
+'.card h2 em{margin-left:auto;font-style:normal;font-size:11px;font-weight:400;color:var(--dim);letter-spacing:0}' +
+'label{display:block;color:var(--mut);font-size:12px;margin:14px 0 6px}' +
+'input[type=text],textarea{width:100%;background:rgba(2,6,14,.6);border:1px solid var(--line);border-radius:10px;color:var(--fg);padding:10px 12px;font:13px/1.5 ui-monospace,Consolas,Menlo,monospace;transition:border-color .18s,box-shadow .18s}' +
+'input:focus,textarea:focus{outline:none;border-color:rgba(94,234,212,.5);box-shadow:0 0 0 3px rgba(45,212,191,.1)}' +
+'textarea{resize:vertical;min-height:84px}' +
+'button{appearance:none;-webkit-appearance:none;border:1px solid transparent;border-radius:10px;padding:9px 18px;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer;color:#052e28;background:linear-gradient(135deg,#5eead4,#38bdf8);box-shadow:0 8px 20px -10px rgba(45,212,191,.6);transition:filter .15s,transform .15s,background .15s}' +
+'button:hover{filter:brightness(1.1);transform:translateY(-1px)}' +
+'button.ghost{background:rgba(148,163,184,.08);border-color:var(--line);color:var(--fg);box-shadow:none}' +
+'button.ghost:hover{background:rgba(148,163,184,.16)}' +
+'button.danger{background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.35);color:#fca5a5;box-shadow:none}' +
+'button.danger:hover{background:rgba(248,113,113,.2)}' +
+'button.mini{padding:6px 13px;font-size:12px;border-radius:8px}' +
+'.btnrow{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px}' +
+'code,a.code{display:block;white-space:pre-wrap;background:rgba(2,6,14,.6);border:1px solid var(--line);border-left:2px solid rgba(94,234,212,.45);border-radius:10px;padding:10px 12px;color:#9fe8c8;font:12px/1.7 ui-monospace,Consolas,monospace;word-break:break-all;margin:6px 0;text-decoration:none;transition:border-color .18s,background .18s}' +
+'a.code:hover{border-color:rgba(94,234,212,.4);background:rgba(4,10,18,.85)}' +
+'.chk{display:inline-flex;align-items:center;gap:9px;margin:10px 24px 0 0;color:var(--fg);font-size:13px;cursor:pointer;user-select:none}' +
+'.chk input{appearance:none;-webkit-appearance:none;width:38px;height:21px;border-radius:999px;background:rgba(148,163,184,.16);border:1px solid var(--line);position:relative;cursor:pointer;transition:background .2s,border-color .2s;flex:none;margin:0;vertical-align:middle}' +
+'.chk input:before{content:"";position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;background:#9aa8b8;transition:left .2s,background .2s}' +
+'.chk input:checked{background:rgba(45,212,191,.32);border-color:rgba(94,234,212,.5)}' +
+'.chk input:checked:before{left:19px;background:#5eead4;box-shadow:0 0 8px rgba(94,234,212,.8)}' +
+'.row{display:flex;gap:14px;flex-wrap:wrap}.row>div{flex:1;min-width:240px}' +
+'.msg{margin-top:10px;font-size:12px;color:var(--ac);min-height:18px}' +
+'.hint{color:var(--dim);font-size:12px;margin-top:12px;line-height:1.8}' +
+'.footer{color:var(--dim);font-size:12px;text-align:center;margin:28px 0 6px}' +
+'.footer a{color:var(--ac);text-decoration:none}' +
+'.footer a:hover{text-decoration:underline}' +
 '.qrbar{margin:2px 0 12px}' +
-'.modal{display:none;position:fixed;inset:0;background:rgba(1,4,9,.82);z-index:99;padding:16px}' +
+'.modal{display:none;position:fixed;inset:0;background:rgba(3,6,12,.72);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);z-index:99;padding:16px}' +
 '.modal.on{display:flex;align-items:center;justify-content:center}' +
-'.modal-box{position:relative;width:100%;max-width:380px;height:min(560px,88vh);background:#0d1117;border:1px solid #30363d;border-radius:10px;overflow:hidden}' +
-'.modal-box iframe{width:100%;height:100%;border:0;display:block}' +
-'.modal-x{position:absolute;top:6px;right:6px;z-index:2;margin:0;padding:2px 10px;background:#21262d;color:#c9d1d9}' +
+'.modal-box{position:relative;width:100%;max-width:400px;height:min(580px,90vh);background:#0a101c;border:1px solid rgba(94,234,212,.22);border-radius:18px;overflow:hidden;box-shadow:0 30px 80px -20px rgba(0,0,0,.85)}' +
+'.modal-box iframe{width:100%;height:100%;border:0;display:block;background:#fff}' +
+'.modal-x{position:absolute;top:8px;right:8px;z-index:2;margin:0;padding:4px 12px;border-radius:8px;background:rgba(10,16,28,.88);color:var(--fg);font-size:12px}' +
+'@media(max-width:640px){.wrap{padding:24px 14px 32px}.card{padding:18px 16px;border-radius:14px}.row>div{min-width:100%}}' +
 '</style></head><body><div class="wrap">' +
-'<h1>NEBULA-DECODE <span class="v">v1.6</span><span class="brand">数码解码 出品</span></h1>' +
-'<div class="sub">Cloudflare Pages 单文件终端 &nbsp;|&nbsp; 节点机房: <b style="color:#58e6d9">' + colo + '</b> &nbsp;|&nbsp; 入口路径: <b style="color:#58e6d9">' + base + '</b> &nbsp;|&nbsp; ' + protoBadges + '</div>';
+'<div class="hero"><div class="mark">' + logoSvg + '</div>' +
+'<h1>NEBULA-DECODE<span class="v">v2.0</span></h1>' +
+'<span class="brand">数码解码 出品</span></div>' +
+'<div class="status"><span class="pill"><span class="dot"></span>节点机房 <b>' + colo + '</b></span>' +
+'<span class="pill">入口路径 <b>' + base + '</b></span>' + protoBadges + '</div>';
 
   const body = html +
-'<div class="card"><h2>[ 节点配置 ]</h2>' +
-'<div class="row"><div><label>UUID（VLESS 凭据，也是面板入口路径）</label><input type="text" id="uuid"><button class="ghost" style="padding:4px 10px;font-size:12px" onclick="genUuid()">🎲 随机生成 UUID</button></div>' +
+'<div class="card" style="animation-delay:.04s"><h2><span class="no">01</span>节点配置<em>保存后立即生效，无需重新部署</em></h2>' +
+'<div class="row"><div><label>UUID（VLESS 凭据，也是面板入口路径）</label><input type="text" id="uuid"></div>' +
 '<div><label>自定义路径（可多级，如 my/nodes；留空用 UUID）</label><input type="text" id="path"></div></div>' +
-'<div class="row"><div><label>ProxyIP（直连 CF 站点无响应时回落，如 1.1.1.1 或 bestcf.top）</label><input type="text" id="proxyIP"></div>' +
+'<div class="btnrow"><button class="ghost mini" onclick="genUuid()">🎲 随机生成 UUID</button></div>' +
+'<div class="row"><div><label>ProxyIP（直连 Cloudflare 自家站点被拒时回落；须为非 CF 段的 SNI 中继，如 ProxyIP.US.CMLiussss.net）</label><input type="text" id="proxyIP"></div>' +
 '<div><label>Trojan 密码（启用 Trojan 时必填）</label><input type="text" id="trojanPassword"></div></div>' +
-'<div class="row"><div><label>API 密钥（可选；设置后所有 /api/* 请求必须携带 X-API-Token 头）</label><input type="text" id="apiToken"><button class="ghost" style="padding:4px 10px;font-size:12px" onclick="genToken()">🎲 随机生成密钥</button></div></div>' +
-'<label style="margin-top:14px">协议开关</label>' +
-'<label class="chk"><input type="checkbox" id="enableVless"> VLESS-WS-TLS</label>' +
-'<label class="chk"><input type="checkbox" id="enableTrojan"> Trojan-WS-TLS</label>' +
-'<button onclick="saveCfg()">保存配置（立即生效）</button><div class="msg" id="msg1"></div>' +
+'<div><label>API 密钥（可选；设置后所有 /api/* 请求必须携带 X-API-Token 头）</label><input type="text" id="apiToken"></div>' +
+'<div class="btnrow"><button class="ghost mini" onclick="genToken()">🎲 随机生成密钥</button></div>' +
+'<label>协议开关</label>' +
+'<div class="btnrow" style="margin-top:4px"><label class="chk"><input type="checkbox" id="enableVless">VLESS-WS-TLS</label>' +
+'<label class="chk"><input type="checkbox" id="enableTrojan">Trojan-WS-TLS</label></div>' +
+'<div class="btnrow"><button onclick="saveCfg()">保存配置 · 立即生效</button></div><div class="msg" id="msg1"></div>' +
 '<div class="hint">提示：修改 UUID / 自定义路径保存后，面板地址会变为新入口路径。</div></div>' +
 
-'<div class="card"><h2>[ 优选 IP / 域名 ]</h2>' +
+'<div class="card" style="animation-delay:.08s"><h2><span class="no">02</span>优选 IP / 域名<em>合并生成订阅节点</em></h2>' +
 '<label>每行一个 IP 或域名（与下方优选域名、内置优选池合并生成订阅节点）</label>' +
 '<textarea id="ips"></textarea>' +
-'<button onclick="addIps()">添加</button><button class="danger" onclick="clearIps()">清空</button><div class="msg" id="msg2"></div>' +
+'<div class="btnrow"><button class="mini" onclick="addIps()">添加</button><button class="danger mini" onclick="clearIps()">清空</button><span class="msg" id="msg2" style="margin:0"></span></div>' +
 '<label>优选域名列表（逗号分隔，内置公共优选域名可自行替换）</label>' +
 '<input type="text" id="preferredDomains">' +
-'<label class="chk"><input type="checkbox" id="useBuiltinPool"> 自动并入内置 Cloudflare 优选 IP 池（28 个，含 HK/SG/JP/US/EU 分组）</label></div>' +
+'<label class="chk" style="margin-top:14px"><input type="checkbox" id="useBuiltinPool">自动并入内置 Cloudflare 优选 IP 池（28 个，含 HK / SG / JP / US / EU 分组）</label></div>' +
 
-'<div class="card"><h2>[ 订阅与导入 ]</h2>' +
+'<div class="card" style="animation-delay:.12s"><h2><span class="no">03</span>订阅与导入<em>桌面一键导入，手机扫码即用</em></h2>' +
 '<label>通用订阅（v2rayN / v2rayNG / Shadowrocket / Nekoray 等，base64）</label>' +
 '<a class="code" id="subA" href="' + subURL + '">' + subURL + '</a>' +
-'<div class="qrbar"><button class="ghost" onclick="copyTo(\'' + subURL + '\',this)">复制通用订阅</button>' +
-'<button class="ghost" onclick="showQr(\'base64\')">📱 显示二维码</button></div>' +
+'<div class="btnrow"><button class="ghost mini" onclick="copyTo(\'' + subURL + '\',this)">复制通用订阅</button>' +
+'<button class="ghost mini" onclick="showQr(\'base64\')">📱 显示二维码</button></div>' +
 '<label>Clash / Stash / Mihomo 订阅（YAML）</label>' +
 '<a class="code" id="clashA" href="' + clashURL + '">' + clashURL + '</a>' +
-'<div class="qrbar"><button class="ghost" onclick="copyTo(\'' + clashURL + '\',this)">复制 Clash 订阅</button>' +
-'<button class="ghost" onclick="showQr(\'clash\')">📱 显示二维码</button></div>' +
+'<div class="btnrow"><button class="ghost mini" onclick="copyTo(\'' + clashURL + '\',this)">复制 Clash 订阅</button>' +
+'<button class="ghost mini" onclick="showQr(\'clash\')">📱 显示二维码</button></div>' +
 '<label>Sing-box 订阅（JSON，v1.8+ 客户端可直接导入）</label>' +
 '<a class="code" id="singboxA" href="' + singboxURL + '">' + singboxURL + '</a>' +
-'<div class="qrbar"><button class="ghost" onclick="copyTo(\'' + singboxURL + '\',this)">复制 Sing-box 订阅</button>' +
-'<button class="ghost" onclick="showQr(\'singbox\')">📱 显示二维码</button></div>' +
+'<div class="btnrow"><button class="ghost mini" onclick="copyTo(\'' + singboxURL + '\',this)">复制 Sing-box 订阅</button>' +
+'<button class="ghost mini" onclick="showQr(\'singbox\')">📱 显示二维码</button></div>' +
 '<label>一键导入</label>' +
-'<button class="ghost" onclick="location.href=\'v2rayng://install-sub?url=\' + encodeURIComponent(\'' + subURL + '\')">v2rayNG</button>' +
-'<button class="ghost" onclick="location.href=\'shadowrocket://add/sub://\' + encodeURIComponent(\'' + subURL + '\')">Shadowrocket</button>' +
-'<button class="ghost" onclick="location.href=\'clash://install-config?url=\' + encodeURIComponent(\'' + clashURL + '\')">Clash</button>' +
-'<button class="ghost" onclick="location.href=\'sing-box://import-remote-profile?url=\' + encodeURIComponent(\'' + singboxURL + '\')">Sing-box</button>' +
+'<div class="btnrow">' +
+'<button class="ghost mini" onclick="location.href=\'v2rayng://install-sub?url=\' + encodeURIComponent(\'' + subURL + '\')">v2rayNG</button>' +
+'<button class="ghost mini" onclick="location.href=\'shadowrocket://add/sub://\' + encodeURIComponent(\'' + subURL + '\')">Shadowrocket</button>' +
+'<button class="ghost mini" onclick="location.href=\'clash://install-config?url=\' + encodeURIComponent(\'' + clashURL + '\')">Clash</button>' +
+'<button class="ghost mini" onclick="location.href=\'sing-box://import-remote-profile?url=\' + encodeURIComponent(\'' + singboxURL + '\')">Sing-box</button></div>' +
 '<div class="hint">客户端也可直接把订阅地址填入「订阅分组」，更新即用；UA 为 Clash / Sing-box 系时自动返回对应格式。手机端可点「显示二维码」扫码导入。</div></div>' +
 
-'<div class="card"><h2>[ API 管理 ]</h2>' +
+'<div class="card" style="animation-delay:.16s"><h2><span class="no">04</span>API 管理<em>所有端点均挂载在入口路径之下</em></h2>' +
 '<code>GET    ' + base + '/api/ips          查询优选 IP</code>' +
 '<code>POST   ' + base + '/api/ips          {"text":"1.2.3.4\\n5.6.7.8"} 批量添加</code>' +
 '<code>DELETE ' + base + '/api/ips?ip=1.2.3.4  删除单个；不带 ip 清空</code>' +
@@ -1501,7 +1532,7 @@ async function renderPanel(url, request, cfg, env) {
 
 '</div>' +
 '<div id="qrModal" class="modal"><div class="modal-box"><button class="modal-x" onclick="hideQr()">✕</button><iframe id="qrFrame" title="订阅二维码"></iframe></div></div>' +
-'<div class="footer">✦ 由 <b style="color:#f0883e">数码解码</b> 出品 · <a href="https://github.com/smzxtv/nebula-decode" target="_blank">GitHub 开源项目</a> ✦</div>' +
+'<div class="footer">✦ 由 <b style="color:#fbbf77">数码解码</b> 出品 · <a href="https://github.com/smzxtv/nebula-decode" target="_blank">GitHub 开源项目</a> ✦</div>' +
 '<script>var BASE=' + JSON.stringify(base + '/') + ';var API_TOKEN=' + JSON.stringify(cfg.apiToken || '') + ';</script>' + PANEL_TAIL;
   return new Response(body, { headers: { 'content-type': 'text/html; charset=utf-8', 'x-powered-by': 'shumajiedu | NEBULA-DECODE' } });
 }
