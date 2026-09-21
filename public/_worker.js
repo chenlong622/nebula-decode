@@ -3,9 +3,12 @@
 //  · VLESS-WS / Trojan-WS 双协议（同一入口自动识别）
 //  · Web 图形化管理面板（挂载在 /{UUID 或自定义路径}）
 //  · 配置存 KV，改完立即生效，无需重新部署
-//  · 订阅生成 + UA 自动识别（base64 / Clash）
+//  · 订阅生成 + UA 自动识别（base64 / Clash / Sing-box）
+//  · 订阅二维码（内置零依赖 QR 编码器，手机扫码导入）
 //  · 优选 IP / 域名管理 + REST API
 //  · ProxyIP 回落（直连无响应自动走 ProxyIP）
+//  · 伪装页（未带正确入口路径 → 返回静态博客首页，防主动扫描）
+//  · API 鉴权（可选 Header 密钥 + 同源校验）
 //  作者: 数码解码  ·  https://github.com/smzxtv/nebula-decode
 // ============================================================
 import { connect } from 'cloudflare:sockets';
@@ -22,6 +25,47 @@ const BUILTIN_PREFERRED = [
   'bestcf.top',
   'cloudflare.182682.xyz',
   'cf.zhetengsha.eu.org',
+];
+
+// 内置 Cloudflare 优选 IP 池（按地区分组；生成订阅时自动与用户配置的域名合并，批量产出节点）
+//
+// 说明与免责：
+//  · 下列地址取自 Cloudflare 官方公开的 Anycast 网段（104.16.0.0/13、172.64.0.0/13、
+//    162.159.0.0/16、188.114.96.0/20、190.93.240.0/20、197.234.240.0/22、198.41.128.0/17、
+//    103.21.244.0/22、103.22.200.0/22、103.31.4.0/22、108.162.192.0/18、131.0.72.0/22、
+//    141.101.64.0/18、173.245.48.0/20）中各取一个代表地址。
+//  · region 仅用于「节点命名 / 分组」（HK / SG / JP / US / EU），并不代表该 IP 的物理落地
+//    机房 —— Cloudflare Anycast 按客户端位置就近调度，真实出口由网络路径决定。
+//  · 这些地址只作为连接地址 (server)；SNI / Host 仍强制为本 Worker 域名，见 buildNodes。
+const BUILTIN_OPTIMAL = [
+  { region: 'HK', host: '104.28.0.1' },
+  { region: 'HK', host: '172.64.145.1' },
+  { region: 'HK', host: '103.21.244.1' },
+  { region: 'HK', host: '173.245.48.1' },
+  { region: 'SG', host: '104.26.0.1' },
+  { region: 'SG', host: '104.27.0.1' },
+  { region: 'SG', host: '162.159.46.1' },
+  { region: 'SG', host: '198.41.128.1' },
+  { region: 'JP', host: '104.24.0.1' },
+  { region: 'JP', host: '104.25.0.1' },
+  { region: 'JP', host: '162.159.36.1' },
+  { region: 'JP', host: '197.234.240.1' },
+  { region: 'US', host: '104.16.0.1' },
+  { region: 'US', host: '104.17.0.1' },
+  { region: 'US', host: '104.18.0.1' },
+  { region: 'US', host: '104.19.0.1' },
+  { region: 'US', host: '172.64.0.1' },
+  { region: 'US', host: '172.67.0.1' },
+  { region: 'US', host: '162.159.0.1' },
+  { region: 'EU', host: '104.21.0.1' },
+  { region: 'EU', host: '104.22.0.1' },
+  { region: 'EU', host: '172.64.80.1' },
+  { region: 'EU', host: '188.114.96.1' },
+  { region: 'EU', host: '190.93.240.1' },
+  { region: 'GLOBAL', host: '103.22.200.1' },
+  { region: 'GLOBAL', host: '103.31.4.1' },
+  { region: 'GLOBAL', host: '108.162.192.1' },
+  { region: 'GLOBAL', host: '131.0.72.1' },
 ];
 
 // ============================ 基础工具 ============================
@@ -131,11 +175,14 @@ async function loadConfig(env) {
     path: normalizeBase(kv.path || env.CUSTOM_PATH || ''),
     proxyIP: String(kv.proxyIP || env.PROXYIP || '').trim(),
     trojanPassword: String(kv.trojanPassword || env.TROJAN_PASSWORD || '').trim(),
+    apiToken: String(kv.apiToken || env.API_TOKEN || '').trim(),
     enableVless: kv.enableVless !== undefined ? !!kv.enableVless : true,
     enableTrojan: kv.enableTrojan !== undefined ? !!kv.enableTrojan : false,
     preferredDomains: Array.isArray(kv.preferredDomains) && kv.preferredDomains.length
       ? kv.preferredDomains.map((s) => String(s).trim()).filter(Boolean)
       : [...BUILTIN_PREFERRED],
+    // 是否把内置 Cloudflare 优选 IP 池并入订阅节点；默认开启（旧配置无此字段也自动开启）
+    useBuiltinPool: kv.useBuiltinPool !== undefined ? !!kv.useBuiltinPool : true,
   };
 }
 
@@ -171,6 +218,50 @@ function jsonResp(obj, status = 200) {
   });
 }
 
+// 常数时间字符串比较：长度不同时也走完整循环，避免通过响应时间逐字节猜测密钥
+function timingSafeEqual(a, b) {
+  const x = String(a == null ? '' : a);
+  const y = String(b == null ? '' : b);
+  let diff = x.length ^ y.length;
+  const n = Math.max(x.length, y.length);
+  for (let i = 0; i < n; i++) {
+    diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);
+  }
+  return diff === 0;
+}
+
+// /api/* 防护：返回 Response 表示拒绝，返回 null 表示放行
+//  ① 路径层：/api/* 只能挂在 UUID / 自定义路径之下（主路由已保证，猜不到路径就够不到）
+//  ② Header 层：设置了 cfg.apiToken 后，所有 /api/* 必须携带 X-API-Token 或 Authorization: Bearer
+//  ③ 同源层：写操作若带 Origin 且与 Host 不一致则拒绝，防止面板被第三方站点跨站调用（CSRF）
+function checkApiAuth(request, cfg) {
+  const method = (request.method || 'GET').toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD') {
+    const origin = request.headers.get('origin');
+    if (origin) {
+      let oh = '';
+      try { oh = new URL(origin).host; } catch (e) { oh = ''; }
+      // Host 头缺失时（部分运行时/测试环境）回退用请求 URL 的 host 推导
+      let host = request.headers.get('host') || '';
+      if (!host) {
+        try { host = new URL(request.url).host; } catch (e) { host = ''; }
+      }
+      if (oh && host && oh !== host) {
+        return jsonResp({ ok: false, error: '跨站请求被拒绝' }, 403);
+      }
+    }
+  }
+
+  if (!cfg.apiToken) return null;   // 未设置密钥 → 仅依赖入口路径保密（向后兼容旧部署）
+
+  const given = request.headers.get('x-api-token')
+    || (request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  if (!timingSafeEqual(given, cfg.apiToken)) {
+    return jsonResp({ ok: false, error: '鉴权失败：缺少或错误的 API 密钥（X-API-Token）' }, 401);
+  }
+  return null;
+}
+
 // ============================ 主路由 ============================
 
 export default {
@@ -187,18 +278,24 @@ export default {
         if (matchBase(pathname, base)) {
           return handleWSTunnel(request, cfg);
         }
-        return camouflage();
+        return camouflage(url, request);
       }
 
       // 面板 / 订阅 / API 均挂在 base 路径下
       const rest = pathname === base ? '' : pathname.startsWith(base + '/') ? pathname.slice(base.length) : null;
-      if (rest === null) return camouflage();
+      if (rest === null) return camouflage(url, request);
 
       if (rest === '' || rest === '/') return renderPanel(url, request, cfg, env);
       if (rest === '/sub') return handleSub(request, url, env, cfg);
-      if (rest === '/api/config') return apiConfig(request, env, cfg);
-      if (rest === '/api/ips') return apiIPs(request, env);
-      return camouflage();
+      if (rest === '/qr') return handleQr(url, cfg);
+
+      // /api/* 双保险：① 必须位于 UUID / 自定义路径之下 ② 可选 Header 密钥 + 同源校验
+      if (rest === '/api/config' || rest === '/api/ips') {
+        const denied = checkApiAuth(request, cfg);
+        if (denied) return denied;
+        return rest === '/api/config' ? apiConfig(request, env, cfg) : apiIPs(request, env);
+      }
+      return camouflage(url, request);
     } catch (err) {
       return new Response('NEBULA-DECODE Error: ' + (err && err.message), {
         status: 500,
@@ -208,12 +305,137 @@ export default {
   },
 };
 
-// 未匹配路径时的伪装页
-function camouflage() {
-  return new Response('<!DOCTYPE html><html><head><meta charset="utf-8"><title>404 Not Found</title></head>' +
-    '<body><center><h1>404 Not Found</h1><hr>nginx</center><!-- 数码解码 · NEBULA-DECODE --></body></html>', {
-    status: 404,
-    headers: { 'content-type': 'text/html; charset=utf-8' },
+// ============================ 伪装页（防主动扫描） ============================
+//
+// 未携带正确入口路径的访问（根路径、扫描器探测的 /admin、/.env 等）不再返回 404，
+// 而是返回一个结构完整的静态博客首页（状态码 200），使站点在主动扫描下表现为普通个人博客。
+// 站点身份由域名做稳定散列选取：同一域名每次返回同一个博客，
+// 不会因为内容随机变化而被扫描器识别为「动态生成的假页面」。
+// 注意：本页面不得出现任何项目名 / 品牌词 / 特征性注释，否则等于主动告诉扫描器这是隧道站点。
+
+const CAMO_IDENTITIES = [
+  { name: '拾光集', tagline: '把日子过成可以回看的片段', author: '阿柚', bio: '写字的人，偶尔拍照片。在这里放一些不想丢掉的东西。' },
+  { name: '晚风手记', tagline: '记录一些没什么用、但很想留下的东西', author: '南舟', bio: '白天上班，晚上写点别的。更新随缘，留言必回。' },
+  { name: '像素与茶', tagline: '写代码，也写字；煮咖啡，也煮茶', author: '老白', bio: '前端工程师。业余爱好是折腾各种工具，以及把工具折腾坏。' },
+  { name: '半山腰', tagline: '爬到一半也挺好的，风景已经够看了', author: '林一', bio: '不赶路的人。喜欢慢慢走，慢慢写，偶尔发呆。' },
+  { name: '周三笔记', tagline: '每周三更新一点点', author: '小满', bio: '读书、做饭、散步，然后把它们写下来。' },
+  { name: '旧木桌', tagline: '桌上摊着没写完的信', author: '陈默', bio: '写信的人。写给别人，也写给自己。' },
+];
+
+const CAMO_POSTS = [
+  ['在雨里走完一条老街', '城市散步', '雨从傍晚开始下，路灯亮起来的时候，整条街的招牌都泡在水里。我撑着伞慢慢走，看每一家店门口的水渍倒映出不同的颜色。'],
+  ['关于早起这件事', '生活习惯', '试过很多次早起，也失败了很多次。后来才明白，问题不在于几点起，而在于起来之后想做什么。'],
+  ['把书架整理了一遍', '读书', '整理书架的时候才发现，有些书买回来就没翻过。它们安静地站在那里，像一个没被拆开的礼物。'],
+  ['第一次自己做面包', '厨房', '面粉、水、酵母和盐，四样东西。听起来简单，但第一次做出来的东西硬得能砸核桃。'],
+  ['城市里的树', '城市观察', '每天上下班都会路过同一排梧桐。直到有一天它们被修剪得光秃秃，我才意识到自己一直在看它们。'],
+  ['写给三年前的自己', '随笔', '你现在很着急，觉得一切都来不及。其实不用急，很多事情要再过两年才会显出意义。'],
+  ['一台旧相机的复活', '数码', '在二手市场淘到一台十几年前的相机，电池鼓包，快门卡顿。拆开清理之后，它居然还能拍。'],
+  ['夜里的便利店', '城市观察', '凌晨一点的便利店有一种特殊的安静，货架上的灯很亮，店员在补货，微波炉在转。'],
+  ['学一门新语言的第一个月', '学习', '最初的新鲜感过去之后，剩下的就是每天重复。重复本身没什么意思，但重复能带来变化。'],
+  ['阳台上的三盆植物', '生活', '一盆活了，一盆半死不活，一盆彻底没了。我至今没搞明白它们的区别到底在哪。'],
+  ['换了一条通勤路线', '城市散步', '多走十分钟，但会经过一个小公园。这十分钟成了一天里我最不着急的时间。'],
+];
+
+const CAMO_TAGS = ['随笔', '城市散步', '读书', '厨房', '数码', '生活', '摄影', '学习', '城市观察', '生活习惯'];
+
+const CAMO_CSS = `
+:root{--ink:#22252b;--muted:#71767f;--line:#e5e7eb;--bg:#fbfbf9;--card:#fff;--accent:#2f6f4e}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--ink);font:16px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+a{color:inherit;text-decoration:none}
+.nav{border-bottom:1px solid var(--line);background:rgba(255,255,255,.86);position:sticky;top:0;z-index:9}
+.nav-inner{max-width:960px;margin:0 auto;padding:14px 22px;display:flex;align-items:center;justify-content:space-between;gap:16px}
+.logo{font-family:Georgia,"Songti SC",serif;font-size:20px;letter-spacing:1px;color:var(--accent)}
+.nav nav{display:flex;gap:20px;font-size:14px;color:var(--muted)}
+.nav nav a:hover{color:var(--accent)}
+.hero{max-width:960px;margin:0 auto;padding:56px 22px 34px;border-bottom:1px solid var(--line)}
+.hero h1{font-family:Georgia,"Songti SC",serif;font-size:38px;font-weight:600;letter-spacing:1px}
+.hero p{margin-top:12px;color:var(--muted);font-size:15px;max-width:34em}
+.layout{max-width:960px;margin:0 auto;padding:36px 22px 60px;display:grid;grid-template-columns:minmax(0,1fr) 260px;gap:44px}
+.post{padding-bottom:26px;margin-bottom:26px;border-bottom:1px dashed var(--line)}
+.post:last-child{border-bottom:0}
+.post h2{font-family:Georgia,"Songti SC",serif;font-size:22px;font-weight:600;margin-bottom:8px}
+.post h2 a:hover{color:var(--accent)}
+.meta{font-size:13px;color:var(--muted);margin-bottom:10px}
+.meta .cat{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:1px 10px;margin-right:8px;background:var(--card)}
+.excerpt{color:#3d4149;font-size:15px}
+.more{display:inline-block;margin-top:10px;font-size:14px;color:var(--accent)}
+.widget{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:20px}
+.widget h3{font-size:14px;letter-spacing:1px;color:var(--muted);font-weight:600;margin-bottom:10px}
+.widget p{font-size:14px;color:#3d4149}
+.tags{display:flex;flex-wrap:wrap;gap:8px}
+.tags span{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:2px 10px;background:var(--bg)}
+footer{border-top:1px solid var(--line);padding:26px 22px;text-align:center;font-size:13px;color:var(--muted)}
+@media(max-width:760px){.layout{grid-template-columns:1fr;gap:28px}.hero h1{font-size:30px}.nav nav{gap:14px}}
+`;
+
+// 由域名派生稳定种子（FNV-1a），保证同域名每次渲染出同一个博客身份
+function hostSeed(host) {
+  let h = 2166136261;
+  for (let i = 0; i < host.length; i++) {
+    h ^= host.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function camouflage(url, request) {
+  const host = (url && url.hostname) || 'localhost';
+  const seed = hostSeed(host);
+  const id = CAMO_IDENTITIES[seed % CAMO_IDENTITIES.length];
+
+  // 文章挑选：步长 7 与 11 条文章互质，保证 5 篇互不重复
+  const posts = [];
+  for (let i = 0; i < 5; i++) {
+    const p = CAMO_POSTS[(seed + i * 7) % CAMO_POSTS.length];
+    const t = new Date(Date.UTC(2026, 7, 20) - (((seed >>> 3) % 120) + i * 19 + 1) * 86400000);
+    posts.push({
+      title: p[0],
+      cat: p[1],
+      excerpt: p[2],
+      date: t.getUTCFullYear() + '-' + String(t.getUTCMonth() + 1).padStart(2, '0') + '-' + String(t.getUTCDate()).padStart(2, '0'),
+    });
+  }
+
+  const tags = [];
+  for (let i = 0; i < 8; i++) tags.push(CAMO_TAGS[(seed + i * 3) % CAMO_TAGS.length]);
+
+  const postHtml = posts.map((p) =>
+    '<article class="post">' +
+      '<h2><a href="/post/' + encodeURIComponent(p.title) + '">' + p.title + '</a></h2>' +
+      '<div class="meta"><span class="cat">' + p.cat + '</span>' + p.date + '</div>' +
+      '<p class="excerpt">' + p.excerpt + '</p>' +
+      '<a class="more" href="/post/' + encodeURIComponent(p.title) + '">阅读全文 →</a>' +
+    '</article>'
+  ).join('\n');
+
+  const html = '<!DOCTYPE html>\n<html lang="zh-CN">\n<head>\n' +
+    '<meta charset="utf-8">\n' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">\n' +
+    '<title>' + id.name + ' · 首页</title>\n' +
+    '<meta name="description" content="' + id.tagline + '">\n' +
+    '<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%227%22 fill=%22%232f6f4e%22/%3E%3C/svg%3E">\n' +
+    '<style>' + CAMO_CSS + '</style>\n' +
+    '</head>\n<body>\n' +
+    '<header class="nav"><div class="nav-inner"><a class="logo" href="/">' + id.name + '</a>' +
+    '<nav><a href="/">首页</a><a href="/archive">归档</a><a href="/tags">标签</a><a href="/about">关于</a></nav>' +
+    '</div></header>\n' +
+    '<section class="hero"><h1>' + id.name + '</h1><p>' + id.tagline + '</p></section>\n' +
+    '<main class="layout">\n<div class="posts">\n' + postHtml + '\n</div>\n' +
+    '<aside>' +
+    '<div class="widget"><h3>关于我</h3><p>' + id.bio + '</p></div>' +
+    '<div class="widget"><h3>标签</h3><div class="tags">' + tags.map((t) => '<span>' + t + '</span>').join('') + '</div></div>' +
+    '<div class="widget"><h3>说两句</h3><p>慢慢写，慢慢看。谢谢你来过。</p></div>' +
+    '</aside>\n</main>\n' +
+    '<footer>© ' + new Date().getUTCFullYear() + ' ' + id.author + ' · 本博客内容版权所有</footer>\n' +
+    '</body>\n</html>';
+
+  return new Response(request && request.method === 'HEAD' ? null : html, {
+    status: 200,
+    headers: {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'public, max-age=600',
+    },
   });
 }
 
@@ -372,31 +594,55 @@ async function forwardTCP(parsed, setUpstream, pipeRemoteToWS, cfg, log, onDead)
     return socket;
   };
 
-  // 第一跳：直连目标地址
-  let socket = await connectAndWrite(parsed.address, parsed.port);
-  setUpstream(socket);
-  const hasData = pipeRemoteToWS(socket);
-
-  // 直连拿到数据前给一个宽限期；超时且配置了 ProxyIP 则回落重连
-  let got = false;
-  if (cfg.proxyIP) {
-    got = await Promise.race([
-      hasData,
-      new Promise((r) => setTimeout(() => r(false), 4000)),
-    ]);
-    if (!got) {
-      log(`直连 ${parsed.address}:${parsed.port} 无响应，回落 ProxyIP ${cfg.proxyIP}`);
-      try { socket.close(); } catch (e) {}
-      socket = await connectAndWrite(cfg.proxyIP, parsed.port);
-      setUpstream(socket);
-      pipeRemoteToWS(socket).finally(onDead);
-      return;
-    }
-  } else {
-    got = await hasData;
+  // 第一跳：直连目标地址。注意 connect() 对被禁止的地址（Cloudflare 自家 IP 段、
+  // 本机 / 内网 IP 等）会**立即抛错**而不是挂起，因此必须 try/catch，
+  // 否则异常会直接炸掉整个握手，下面的 ProxyIP 回落永远没有机会执行。
+  let socket = null;
+  try {
+    socket = await connectAndWrite(parsed.address, parsed.port);
+  } catch (err) {
+    log(`直连 ${parsed.address}:${parsed.port} 被拒: ${err && err.message}`);
+    if (socket) { try { socket.close(); } catch (e) {} socket = null; }
   }
-  if (!got) onDead();
+
+  if (socket) {
+    setUpstream(socket);
+    const hasData = pipeRemoteToWS(socket);
+
+    // 直连拿到数据前给一个宽限期；超时且配置了 ProxyIP 则回落重连
+    let got = false;
+    if (cfg.proxyIP) {
+      got = await Promise.race([
+        hasData,
+        new Promise((r) => setTimeout(() => r(false), 4000)),
+      ]);
+      if (!got) {
+        log(`直连 ${parsed.address}:${parsed.port} 无响应，回落 ProxyIP ${cfg.proxyIP}`);
+        try { socket.close(); } catch (e) {}
+        socket = await connectAndWrite(cfg.proxyIP, parsed.port);
+        setUpstream(socket);
+        pipeRemoteToWS(socket).finally(onDead);
+        return;
+      }
+    } else {
+      got = await hasData;
+    }
+    if (!got) onDead();
+    return;
+  }
+
+  // 直连被立即拒绝（典型：目标是 Cloudflare 自家站点）。此时必须走 ProxyIP 回落，
+  // 否则该站点永远打不开。ProxyIP 必须是「非 Cloudflare IP 的、按 SNI 中继裸 TCP」
+  // 的服务器，Worker 会把客户端发来的原始 TLS 握手（含目标 SNI）转发给它。
+  if (!cfg.proxyIP) {
+    throw new Error(`无法直连 ${parsed.address}:${parsed.port}，且未配置 ProxyIP 回落`);
+  }
+  log(`直连 ${parsed.address}:${parsed.port} 失败，回落 ProxyIP ${cfg.proxyIP}`);
+  socket = await connectAndWrite(cfg.proxyIP, parsed.port);
+  setUpstream(socket);
+  pipeRemoteToWS(socket).finally(onDead);
 }
+
 
 // ============================ 协议解析（VLESS / Trojan 自动识别） ============================
 
@@ -496,17 +742,29 @@ function parseAddress(bytes, dv, addrType, start) {
 
 // ============================ 节点 / 订阅生成 ============================
 
-// 汇总节点列表：本 Worker 域名 + 优选域名 + 优选 IP
+// 汇总节点列表：本 Worker 域名 + 用户优选域名 + 内置优选池 + 用户优选 IP
+// 面板里手填的域名往往只有几个，节点过于单薄；因此把内置 BUILTIN_OPTIMAL 一并并入，
+// 去重后批量生成，节点命名带地区前缀（如 HK-104.28.0.1）便于在客户端里挑选。
 function buildNodes(url, cfg, ips) {
   const wsPath = accessBase(cfg) + '?ed=2048';
+  const labels = new Map();          // host -> 地区标签（仅用于命名）
   const hosts = [];
-  const push = (h) => {
+  const push = (h, label) => {
     h = String(h || '').trim();
-    if (h && !hosts.includes(h)) hosts.push(h);
+    if (!h) return;
+    if (labels.has(h)) {             // 已存在：仅在原来没有标签时补上
+      if (!labels.get(h) && label) labels.set(h, label);
+      return;
+    }
+    labels.set(h, label || '');
+    hosts.push(h);
   };
-  push(url.hostname);
-  cfg.preferredDomains.forEach(push);
-  ips.forEach(push);
+  push(url.hostname, 'SELF');
+  cfg.preferredDomains.forEach((d) => push(d));
+  if (cfg.useBuiltinPool !== false) {  // 默认开启；显式关掉则只用用户自己填的
+    for (const item of BUILTIN_OPTIMAL) push(item.host, item.region);
+  }
+  ips.forEach((ip) => push(ip));
 
   const nodes = [];
   hosts.forEach((host) => {
@@ -514,7 +772,9 @@ function buildNodes(url, cfg, ips) {
     // 关键: SNI/Host 头必须始终用 Worker 自己的域名, Cloudflare 才会把请求路由到本 Worker;
     // 优选域名/IP 只作为连接地址 (server), 决定客户端到 CF 边缘的链路质量
     const sni = url.hostname;
-    const name = ipNode ? (isIPv4(host) ? 'IP-' + host : 'IPv6-' + host) : host;
+    const base = ipNode ? (isIPv4(host) ? 'IP-' + host : 'IPv6-' + host) : host;
+    const label = labels.get(host);
+    const name = (label && label !== 'SELF') ? label + '-' + base : base;
     if (cfg.enableVless) {
       nodes.push({
         proto: 'vless', name, server: host, port: 443,
@@ -577,12 +837,61 @@ function buildClashYaml(nodes) {
   return lines.join('\n') + '\n';
 }
 
+// Sing-box 配置（JSON，v1.8+ 客户端可直接导入 / 作为远程订阅）
+// 说明：刻意省略 dns 段，改用系统默认 DNS —— sing-box 1.11/1.12 大改过 dns 字段语法，
+// 写死任一种都会让另一批客户端导入失败；留给客户端自己的 dns 配置更稳。
+function buildSingBox(nodes) {
+  const outbounds = nodes.map((n) => {
+    const tls = {
+      enabled: true,
+      server_name: n.sni,
+      insecure: false,
+      utls: { enabled: true, fingerprint: 'chrome' },
+    };
+    const transport = { type: 'ws', path: n.path, headers: { Host: n.host } };
+    return n.proto === 'vless'
+      ? {
+        type: 'vless', tag: n.name, server: n.server, server_port: 443,
+        uuid: n.uuid, flow: '', packet_encoding: 'xudp', tls, transport,
+      }
+      : {
+        type: 'trojan', tag: n.name, server: n.server, server_port: 443,
+        password: n.password, packet_encoding: 'xudp', tls, transport,
+      };
+  });
+
+  const tags = outbounds.map((o) => o.tag);
+  const chain = tags.length ? tags : ['direct'];
+  const config = {
+    log: { level: 'info', timestamp: true },
+    inbounds: [
+      { type: 'mixed', tag: 'mixed-in', listen: '127.0.0.1', listen_port: 2080, sniff: true },
+    ],
+    outbounds: [
+      { type: 'selector', tag: 'NEBULA-DECODE', outbounds: ['auto', ...chain], default: 'auto' },
+      {
+        type: 'urltest', tag: 'auto', outbounds: chain,
+        url: 'https://www.gstatic.com/generate_204', interval: '3m', tolerance: 50,
+      },
+      ...outbounds,
+      { type: 'direct', tag: 'direct' },
+    ],
+    route: {
+      rules: [{ ip_is_private: true, outbound: 'direct' }],
+      final: 'NEBULA-DECODE',
+      auto_detect_interface: true,
+    },
+  };
+  return JSON.stringify(config, null, 2) + '\n';
+}
+
 async function handleSub(request, url, env, cfg) {
   const ips = await getPreferredIPs(env);
   const nodes = buildNodes(url, cfg, ips);
   const ua = (request.headers.get('user-agent') || '').toLowerCase();
-  const target = url.searchParams.get('target')
-    || (ua.includes('clash') || ua.includes('stash') || ua.includes('mihomo') ? 'clash' : 'base64');
+  const target = (url.searchParams.get('target') || '').toLowerCase()
+    || (ua.includes('clash') || ua.includes('stash') || ua.includes('mihomo') ? 'clash'
+      : (ua.includes('sing-box') || ua.includes('singbox') ? 'singbox' : 'base64'));
 
   const headers = { 'content-type': 'text/plain; charset=utf-8', 'x-powered-by': 'shumajiedu | NEBULA-DECODE' };
   if (target === 'clash') {
@@ -590,8 +899,428 @@ async function handleSub(request, url, env, cfg) {
     headers['content-disposition'] = 'attachment; filename="nebula-decode.yaml"';
     return new Response(buildClashYaml(nodes), { headers });
   }
+  if (target === 'singbox' || target === 'sing-box') {
+    headers['content-type'] = 'application/json; charset=utf-8';
+    headers['content-disposition'] = 'attachment; filename="nebula-decode.json"';
+    return new Response(buildSingBox(nodes), { headers });
+  }
   const text = nodes.map((n) => n.link).join('\n');
   return new Response(bytesToB64(new TextEncoder().encode(text)), { headers });
+}
+
+// ============================ QR 编码器（零依赖） ============================
+//
+// 完整实现 ISO/IEC 18004：字节模式、版本 1-40、ECC L/M/Q/H、Reed-Solomon 纠错、
+// 8 种掩码自动优选（含 4 项罚分规则）、格式信息 BCH(15,5) 与版本信息 BCH(18,6)。
+// 之所以内置而不引 CDN：整站是单文件 Worker，外部脚本会带来额外请求、破坏离线可用性，
+// 并可能与 CSP / 隐私策略冲突。输出为按行游程合并的紧凑 SVG，体积小、无需外部字体。
+
+const QR_ECL = { L: 0, M: 1, Q: 2, H: 3 };
+const QR_ECL_FMT = { L: 1, M: 0, Q: 3, H: 2 };
+
+// 每块纠错码字数（[ecl][version]，下标 0 为占位）
+const QR_ECC_PER_BLOCK = [
+  [-1, 7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28, 28, 28, 30, 30, 26, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30],
+  [-1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28],
+  [-1, 13, 22, 18, 26, 18, 24, 18, 22, 20, 24, 28, 26, 24, 20, 30, 24, 28, 28, 26, 30, 28, 30, 30, 30, 30, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30],
+  [-1, 17, 28, 22, 16, 22, 28, 26, 26, 24, 28, 24, 28, 22, 24, 24, 30, 28, 28, 26, 28, 30, 24, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30],
+];
+
+// 纠错块数量（[ecl][version]，下标 0 为占位）
+const QR_EC_BLOCKS = [
+  [-1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8, 8, 9, 9, 10, 12, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 24, 25],
+  [-1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49],
+  [-1, 1, 1, 2, 2, 4, 4, 6, 6, 8, 8, 8, 10, 12, 16, 12, 17, 16, 18, 21, 20, 23, 23, 25, 27, 29, 34, 34, 35, 38, 40, 43, 45, 48, 51, 53, 56, 59, 62, 65, 68],
+  [-1, 1, 1, 2, 4, 4, 4, 5, 6, 8, 8, 11, 11, 16, 16, 18, 16, 19, 21, 25, 25, 25, 34, 30, 32, 35, 37, 40, 42, 45, 48, 51, 54, 57, 60, 63, 66, 70, 74, 77, 81],
+];
+
+// GF(2^8) 乘法，本原多项式 0x11D
+function qrGfMul(x, y) {
+  let z = 0;
+  for (let i = 7; i >= 0; i--) {
+    z = (z << 1) ^ ((z >>> 7) * 0x11D);
+    z ^= ((y >>> i) & 1) * x;
+  }
+  return z & 0xFF;
+}
+
+// 指定版本的数据模块总数（ISO/IEC 18004 公式，免去硬编码 40 行表）
+function qrRawModules(ver) {
+  let r = (16 * ver + 128) * ver + 64;
+  if (ver >= 2) {
+    const n = Math.floor(ver / 7) + 2;
+    r -= (25 * n - 10) * n - 55;
+    if (ver >= 7) r -= 36;
+  }
+  return r;
+}
+
+function qrDataCodewords(ver, ecl) {
+  return Math.floor(qrRawModules(ver) / 8) - QR_ECC_PER_BLOCK[ecl][ver] * QR_EC_BLOCKS[ecl][ver];
+}
+
+// 选能容纳 len 字节的最小版本
+function qrPickVersion(len, ecl) {
+  for (let v = 1; v <= 40; v++) {
+    const need = 4 + (v <= 9 ? 8 : 16) + len * 8;
+    if (need <= qrDataCodewords(v, ecl) * 8) return v;
+  }
+  return -1;
+}
+
+// Reed-Solomon 生成多项式（次数 deg）
+function qrRsDivisor(deg) {
+  const result = new Uint8Array(deg);
+  result[deg - 1] = 1;
+  let root = 1;
+  for (let i = 0; i < deg; i++) {
+    for (let j = 0; j < deg; j++) {
+      result[j] = qrGfMul(result[j], root);
+      if (j + 1 < deg) result[j] ^= result[j + 1];
+    }
+    root = qrGfMul(root, 0x02);
+  }
+  return result;
+}
+
+function qrRsRemainder(data, divisor) {
+  const result = new Uint8Array(divisor.length);
+  for (const b of data) {
+    const factor = b ^ result[0];
+    result.copyWithin(0, 1);
+    result[result.length - 1] = 0;
+    for (let i = 0; i < divisor.length; i++) result[i] ^= qrGfMul(divisor[i], factor);
+  }
+  return result;
+}
+
+// 分块做 RS 纠错，再按 ISO/IEC 18004 规则交错输出最终码字流
+function qrAddEcc(data, ver, ecl) {
+  const numBlocks = QR_EC_BLOCKS[ecl][ver];
+  const eccLen = QR_ECC_PER_BLOCK[ecl][ver];
+  const rawCodewords = Math.floor(qrRawModules(ver) / 8);
+  const numShort = numBlocks - (rawCodewords % numBlocks);
+  const shortLen = Math.floor(rawCodewords / numBlocks);
+  const divisor = qrRsDivisor(eccLen);
+  const blocks = [];
+  for (let i = 0, k = 0; i < numBlocks; i++) {
+    const datLen = shortLen - eccLen + (i < numShort ? 0 : 1);
+    const dat = data.slice(k, k + datLen);
+    k += datLen;
+    const ecc = Array.from(qrRsRemainder(dat, divisor));
+    if (i < numShort) dat.push(0); // 短块占位，保证交错列对齐
+    blocks.push(dat.concat(ecc));
+  }
+  const out = [];
+  for (let i = 0; i < blocks[0].length; i++) {
+    for (let j = 0; j < blocks.length; j++) {
+      if (i !== shortLen - eccLen || j >= numShort) out.push(blocks[j][i]);
+    }
+  }
+  return out;
+}
+
+// 字节模式位流 + 填充（终止符 / 字节对齐 / 0xEC-0x11 交替填充）
+function qrBitstream(bytes, ver, ecl) {
+  const bits = [];
+  const push = (val, len) => {
+    for (let i = len - 1; i >= 0; i--) bits.push((val >>> i) & 1);
+  };
+  push(4, 4); // 字节模式
+  push(bytes.length, ver <= 9 ? 8 : 16);
+  for (const b of bytes) push(b, 8);
+  const capacity = qrDataCodewords(ver, ecl) * 8;
+  push(0, Math.min(4, capacity - bits.length));
+  push(0, (8 - (bits.length % 8)) % 8);
+  for (let pad = 0xEC; bits.length < capacity; pad ^= 0xEC ^ 0x11) push(pad, 8);
+  const out = [];
+  for (let i = 0; i < bits.length; i += 8) {
+    let b = 0;
+    for (let j = 0; j < 8; j++) b = (b << 1) | bits[i + j];
+    out.push(b);
+  }
+  return out;
+}
+
+// 文本 -> QR 矩阵（自动选版本、纠错、掩码）
+function qrEncode(text, eclName) {
+  const name = QR_ECL[eclName] != null ? eclName : 'M';
+  const ecl = QR_ECL[name];
+  const bytes = Array.from(new TextEncoder().encode(text));
+  const ver = qrPickVersion(bytes.length, ecl);
+  if (ver < 0) throw new Error('内容过长，超出 QR 版本 40 容量');
+  const codewords = qrAddEcc(qrBitstream(bytes, ver, ecl), ver, ecl);
+  return qrBuildMatrix(ver, codewords, name);
+}
+
+// 格式信息 BCH(15,5)，最后异或 0x5412 掩码
+function qrFormatBits(eclName, mask) {
+  const data = (QR_ECL_FMT[eclName] << 3) | mask;
+  let rem = data;
+  for (let i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
+  return ((data << 10) | rem) ^ 0x5412;
+}
+
+// 版本信息 BCH(18,6)，仅版本 >= 7 需要
+function qrVersionBits(ver) {
+  let rem = ver;
+  for (let i = 0; i < 12; i++) rem = (rem << 1) ^ ((rem >>> 11) * 0x1F25);
+  return (ver << 12) | rem;
+}
+
+// 对齐图形中心坐标（ISO/IEC 18004 附录 E 步长规则）
+function qrAlignPositions(ver, size) {
+  if (ver === 1) return [];
+  const num = Math.floor(ver / 7) + 2;
+  const step = ver === 32 ? 26 : Math.ceil((ver * 4 + 4) / (num * 2 - 2)) * 2;
+  const result = [6];
+  for (let pos = size - 7; result.length < num; pos -= step) result.splice(1, 0, pos);
+  return result;
+}
+
+// 在矩阵上放置一个模块，并标记为功能图形（不参与掩码与数据填充）
+function qrSetFn(mod, isFn, size, x, y, dark) {
+  mod[y * size + x] = dark ? 1 : 0;
+  isFn[y * size + x] = 1;
+}
+
+// 定位图形 + 分隔符：以 (cx,cy) 为中心，dist 为切比雪夫距离
+// dist 0/1 → 实心；2 → 白环；3 → 实心；4 → 分隔符（白）
+function qrPlaceFinder(mod, isFn, size, cx, cy) {
+  for (let dy = -4; dy <= 4; dy++) {
+    for (let dx = -4; dx <= 4; dx++) {
+      const x = cx + dx, y = cy + dy;
+      if (x < 0 || x >= size || y < 0 || y >= size) continue;
+      const dist = Math.max(Math.abs(dx), Math.abs(dy));
+      qrSetFn(mod, isFn, size, x, y, dist !== 2 && dist !== 4);
+    }
+  }
+}
+
+// 定时图形：第 6 行 / 第 6 列交替黑白，供解码器定位模块栅格
+function qrPlaceTiming(mod, isFn, size) {
+  for (let i = 0; i < size; i++) {
+    qrSetFn(mod, isFn, size, 6, i, i % 2 === 0);
+    qrSetFn(mod, isFn, size, i, 6, i % 2 === 0);
+  }
+}
+
+// 校正图形 5x5（中心实心，外圈白环，最外圈实心）
+function qrPlaceAlignment(mod, isFn, size, cx, cy) {
+  for (let dy = -2; dy <= 2; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      qrSetFn(mod, isFn, size, cx + dx, cy + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+    }
+  }
+}
+
+// 格式信息：共 15 bit，在左上角与右上/左下两份镜像放置，另含固定暗模块
+function qrPlaceFormat(mod, isFn, size, mask, eclName) {
+  const bits = qrFormatBits(eclName, mask);
+  for (let i = 0; i <= 5; i++) qrSetFn(mod, isFn, size, 8, i, ((bits >>> i) & 1) !== 0);
+  qrSetFn(mod, isFn, size, 8, 7, ((bits >>> 6) & 1) !== 0);
+  qrSetFn(mod, isFn, size, 8, 8, ((bits >>> 7) & 1) !== 0);
+  qrSetFn(mod, isFn, size, 7, 8, ((bits >>> 8) & 1) !== 0);
+  for (let i = 9; i < 15; i++) qrSetFn(mod, isFn, size, 14 - i, 8, ((bits >>> i) & 1) !== 0);
+  for (let i = 0; i < 8; i++) qrSetFn(mod, isFn, size, size - 1 - i, 8, ((bits >>> i) & 1) !== 0);
+  for (let i = 8; i < 15; i++) qrSetFn(mod, isFn, size, 8, size - 15 + i, ((bits >>> i) & 1) !== 0);
+  qrSetFn(mod, isFn, size, 8, size - 8, true);
+}
+
+// 版本信息：18 bit，仅版本 >= 7 需要，同样两份镜像放置
+function qrPlaceVersion(mod, isFn, size, ver) {
+  if (ver < 7) return;
+  const bits = qrVersionBits(ver);
+  for (let i = 0; i < 18; i++) {
+    const bit = ((bits >>> i) & 1) !== 0;
+    const a = size - 11 + (i % 3);
+    const b = Math.floor(i / 3);
+    qrSetFn(mod, isFn, size, a, b, bit);
+    qrSetFn(mod, isFn, size, b, a, bit);
+  }
+}
+
+// 数据区按 ISO/IEC 18004 的之字形（两列一组、上下交替）填充
+function qrPlaceData(mod, isFn, size, codewords) {
+  let i = 0;
+  const total = codewords.length * 8;
+  for (let right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5; // 跳过竖直定时列
+    for (let vert = 0; vert < size; vert++) {
+      for (let j = 0; j < 2; j++) {
+        const x = right - j;
+        const upward = ((right + 1) & 2) === 0;
+        const y = upward ? size - 1 - vert : vert;
+        if (!isFn[y * size + x] && i < total) {
+          mod[y * size + x] = (codewords[i >>> 3] >>> (7 - (i & 7))) & 1;
+          i++;
+        }
+      }
+    }
+  }
+}
+
+// 8 种掩码函数（ISO/IEC 18004 表 10）
+function qrMaskBit(mask, x, y) {
+  switch (mask) {
+    case 0: return (x + y) % 2 === 0;
+    case 1: return y % 2 === 0;
+    case 2: return x % 3 === 0;
+    case 3: return (x + y) % 3 === 0;
+    case 4: return (Math.floor(x / 3) + Math.floor(y / 2)) % 2 === 0;
+    case 5: return ((x * y) % 2) + ((x * y) % 3) === 0;
+    case 6: return (((x * y) % 2) + ((x * y) % 3)) % 2 === 0;
+    default: return (((x + y) % 2) + ((x * y) % 3)) % 2 === 0;
+  }
+}
+
+// 对数据区异或掩码；同一函数再次调用即可撤销（XOR 自反）
+function qrApplyMask(mod, isFn, size, mask) {
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      if (!isFn[y * size + x] && qrMaskBit(mask, x, y)) mod[y * size + x] ^= 1;
+    }
+  }
+}
+
+// 四类罚分（ISO/IEC 18004 表 11），用于在 8 种掩码中挑最优
+function qrPenalty(mod, size) {
+  let result = 0;
+  const at = (x, y) => mod[y * size + x];
+
+  // 规则 1：行 / 列上同色连续模块 >= 5（3 + 超出部分）
+  for (let y = 0; y < size; y++) {
+    let run = 1;
+    for (let x = 1; x < size; x++) {
+      if (at(x, y) === at(x - 1, y)) { run++; if (run === 5) result += 3; else if (run > 5) result++; }
+      else run = 1;
+    }
+  }
+  for (let x = 0; x < size; x++) {
+    let run = 1;
+    for (let y = 1; y < size; y++) {
+      if (at(x, y) === at(x, y - 1)) { run++; if (run === 5) result += 3; else if (run > 5) result++; }
+      else run = 1;
+    }
+  }
+
+  // 规则 2：2x2 同色块，每处 +3
+  for (let y = 0; y < size - 1; y++) {
+    for (let x = 0; x < size - 1; x++) {
+      const c = at(x, y);
+      if (c === at(x + 1, y) && c === at(x, y + 1) && c === at(x + 1, y + 1)) result += 3;
+    }
+  }
+
+  // 规则 3：类定位图形的 1:1:3:1:1 序列（含一侧 4 个浅色模块），每处 +40
+  const P1 = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0];
+  const P2 = [0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1];
+  const hit = (get, i) => {
+    let a = true, b = true;
+    for (let k = 0; k < 11 && (a || b); k++) {
+      const v = get(i + k);
+      if (v !== P1[k]) a = false;
+      if (v !== P2[k]) b = false;
+    }
+    return a || b;
+  };
+  for (let y = 0; y < size; y++) {
+    const get = (i) => at(i, y);
+    for (let x = 0; x + 11 <= size; x++) if (hit(get, x)) result += 40;
+  }
+  for (let x = 0; x < size; x++) {
+    const get = (i) => at(x, i);
+    for (let y = 0; y + 11 <= size; y++) if (hit(get, y)) result += 40;
+  }
+
+  // 规则 4：深色模块占比每偏离 50% 达 5%，罚 10 分
+  let dark = 0;
+  for (let i = 0; i < mod.length; i++) dark += mod[i];
+  result += Math.floor(Math.abs(dark * 100 / (size * size) - 50) / 5) * 10;
+  return result;
+}
+
+// 组装最终矩阵：功能图形 → 数据 → 8 种掩码择优
+function qrBuildMatrix(ver, codewords, eclName) {
+  const size = ver * 4 + 17;
+  const mod = new Uint8Array(size * size);
+  const isFn = new Uint8Array(size * size);
+
+  qrPlaceFinder(mod, isFn, size, 3, 3);
+  qrPlaceFinder(mod, isFn, size, size - 4, 3);
+  qrPlaceFinder(mod, isFn, size, 3, size - 4);
+  qrPlaceTiming(mod, isFn, size);
+
+  const aligns = qrAlignPositions(ver, size);
+  for (let i = 0; i < aligns.length; i++) {
+    for (let j = 0; j < aligns.length; j++) {
+      if ((i === 0 && j === 0) || (i === 0 && j === aligns.length - 1) || (i === aligns.length - 1 && j === 0)) continue;
+      qrPlaceAlignment(mod, isFn, size, aligns[i], aligns[j]);
+    }
+  }
+
+  qrPlaceFormat(mod, isFn, size, 0, eclName); // 先占位，确保数据区跳过这些模块
+  qrPlaceVersion(mod, isFn, size, ver);
+  qrPlaceData(mod, isFn, size, codewords);
+
+  let bestMask = 0, bestScore = Infinity;
+  for (let mask = 0; mask < 8; mask++) {
+    qrApplyMask(mod, isFn, size, mask);
+    qrPlaceFormat(mod, isFn, size, mask, eclName);
+    const score = qrPenalty(mod, size);
+    if (score < bestScore) { bestScore = score; bestMask = mask; }
+    qrApplyMask(mod, isFn, size, mask); // XOR 自反，撤销本轮的掩码
+  }
+  qrApplyMask(mod, isFn, size, bestMask);
+  qrPlaceFormat(mod, isFn, size, bestMask, eclName);
+  return mod;
+}
+
+// 矩阵 → SVG：按行把连续的深色模块合并成一条 path，节点数极少、无需外部字体
+function qrSvg(mod, scale = 4, border = 4) {
+  const size = Math.round(Math.sqrt(mod.length));
+  const dim = (size + border * 2) * scale;
+  let path = '';
+  for (let y = 0; y < size; y++) {
+    let x = 0;
+    while (x < size) {
+      if (!mod[y * size + x]) { x++; continue; }
+      let run = 1;
+      while (x + run < size && mod[y * size + x + run]) run++;
+      path += 'M' + (x + border) * scale + ' ' + (y + border) * scale +
+        'h' + run * scale + 'v' + scale + 'h-' + run * scale + 'z';
+      x += run;
+    }
+  }
+  return '<svg xmlns="http://www.w3.org/2000/svg" width="' + dim + '" height="' + dim +
+    '" viewBox="0 0 ' + dim + ' ' + dim + '" shape-rendering="crispEdges">' +
+    '<rect width="' + dim + '" height="' + dim + '" fill="#ffffff"/>' +
+    '<path d="' + path + '" fill="#000000"/></svg>';
+}
+
+// /qr?t=base64|clash|singbox —— 把对应订阅地址渲染成二维码（SVG）
+function handleQr(url, cfg) {
+  const t = (url.searchParams.get('t') || 'base64').toLowerCase();
+  const target = (t === 'clash' || t === 'stash' || t === 'mihomo') ? 'clash'
+    : (t === 'singbox' || t === 'sing-box') ? 'singbox' : 'base64';
+  const subURL = url.origin + accessBase(cfg) + '/sub' + (target === 'base64' ? '' : '?target=' + target);
+
+  let svg;
+  try {
+    svg = qrSvg(qrEncode(subURL, 'M'));
+  } catch (err) {
+    return new Response('QR 生成失败: ' + (err && err.message), {
+      status: 500,
+      headers: { 'content-type': 'text/plain; charset=utf-8' },
+    });
+  }
+  return new Response(svg, {
+    headers: {
+      'content-type': 'image/svg+xml; charset=utf-8',
+      'cache-control': 'public, max-age=3600',
+      'x-powered-by': 'shumajiedu | NEBULA-DECODE',
+    },
+  });
 }
 
 // ============================ REST API ============================
@@ -617,11 +1346,13 @@ async function apiConfig(request, env, cfg) {
       path,
       proxyIP: String(body.proxyIP || '').trim(),
       trojanPassword: String(body.trojanPassword || '').trim(),
+      apiToken: String(body.apiToken || '').trim(),
       enableVless: !!body.enableVless,
       enableTrojan: !!body.enableTrojan,
       preferredDomains: Array.isArray(body.preferredDomains)
         ? body.preferredDomains.map((s) => String(s).trim()).filter(Boolean)
         : [...BUILTIN_PREFERRED],
+      useBuiltinPool: body.useBuiltinPool !== false,
     };
     if (!next.enableVless && !(next.enableTrojan && next.trojanPassword)) {
       return jsonResp({ ok: false, error: '至少启用一个协议（Trojan 需设置密码）' }, 400);
@@ -672,6 +1403,7 @@ async function renderPanel(url, request, cfg, env) {
   const base = accessBase(cfg);
   const subURL = url.origin + base + '/sub';
   const clashURL = url.origin + base + '/sub?target=clash';
+  const singboxURL = url.origin + base + '/sub?target=singbox';
   const protoBadges =
     (cfg.enableVless ? '<span class="badge ok">VLESS-WS</span>' : '<span class="badge off">VLESS 关</span>') +
     (cfg.enableTrojan && cfg.trojanPassword ? '<span class="badge ok">TROJAN-WS</span>' : '<span class="badge off">TROJAN 关</span>') +
@@ -710,8 +1442,14 @@ async function renderPanel(url, request, cfg, env) {
 '.brand{color:#f0883e;border:1px solid #7d4e1e;border-radius:4px;padding:1px 8px;font-size:12px;margin-left:10px;vertical-align:2px}' +
 '.footer{color:#4a5568;font-size:12px;text-align:center;margin:18px 0 4px}' +
 '.footer a{color:#58e6d9;text-decoration:none}' +
+'.qrbar{margin:2px 0 12px}' +
+'.modal{display:none;position:fixed;inset:0;background:rgba(1,4,9,.82);z-index:99;padding:16px}' +
+'.modal.on{display:flex;align-items:center;justify-content:center}' +
+'.modal-box{position:relative;width:100%;max-width:380px;height:min(560px,88vh);background:#0d1117;border:1px solid #30363d;border-radius:10px;overflow:hidden}' +
+'.modal-box iframe{width:100%;height:100%;border:0;display:block}' +
+'.modal-x{position:absolute;top:6px;right:6px;z-index:2;margin:0;padding:2px 10px;background:#21262d;color:#c9d1d9}' +
 '</style></head><body><div class="wrap">' +
-'<h1>NEBULA-DECODE <span class="v">v1.2.2-probe</span><span class="brand">数码解码 出品</span></h1>' +
+'<h1>NEBULA-DECODE <span class="v">v1.6</span><span class="brand">数码解码 出品</span></h1>' +
 '<div class="sub">Cloudflare Pages 单文件终端 &nbsp;|&nbsp; 节点机房: <b style="color:#58e6d9">' + colo + '</b> &nbsp;|&nbsp; 入口路径: <b style="color:#58e6d9">' + base + '</b> &nbsp;|&nbsp; ' + protoBadges + '</div>';
 
   const body = html +
@@ -720,6 +1458,7 @@ async function renderPanel(url, request, cfg, env) {
 '<div><label>自定义路径（可多级，如 my/nodes；留空用 UUID）</label><input type="text" id="path"></div></div>' +
 '<div class="row"><div><label>ProxyIP（直连 CF 站点无响应时回落，如 1.1.1.1 或 bestcf.top）</label><input type="text" id="proxyIP"></div>' +
 '<div><label>Trojan 密码（启用 Trojan 时必填）</label><input type="text" id="trojanPassword"></div></div>' +
+'<div class="row"><div><label>API 密钥（可选；设置后所有 /api/* 请求必须携带 X-API-Token 头）</label><input type="text" id="apiToken"><button class="ghost" style="padding:4px 10px;font-size:12px" onclick="genToken()">🎲 随机生成密钥</button></div></div>' +
 '<label style="margin-top:14px">协议开关</label>' +
 '<label class="chk"><input type="checkbox" id="enableVless"> VLESS-WS-TLS</label>' +
 '<label class="chk"><input type="checkbox" id="enableTrojan"> Trojan-WS-TLS</label>' +
@@ -727,25 +1466,32 @@ async function renderPanel(url, request, cfg, env) {
 '<div class="hint">提示：修改 UUID / 自定义路径保存后，面板地址会变为新入口路径。</div></div>' +
 
 '<div class="card"><h2>[ 优选 IP / 域名 ]</h2>' +
-'<label>每行一个 IP 或域名（会与下方优选域名合并生成订阅节点）</label>' +
+'<label>每行一个 IP 或域名（与下方优选域名、内置优选池合并生成订阅节点）</label>' +
 '<textarea id="ips"></textarea>' +
 '<button onclick="addIps()">添加</button><button class="danger" onclick="clearIps()">清空</button><div class="msg" id="msg2"></div>' +
 '<label>优选域名列表（逗号分隔，内置公共优选域名可自行替换）</label>' +
-'<input type="text" id="preferredDomains"></div>' +
+'<input type="text" id="preferredDomains">' +
+'<label class="chk"><input type="checkbox" id="useBuiltinPool"> 自动并入内置 Cloudflare 优选 IP 池（28 个，含 HK/SG/JP/US/EU 分组）</label></div>' +
 
 '<div class="card"><h2>[ 订阅与导入 ]</h2>' +
 '<label>通用订阅（v2rayN / v2rayNG / Shadowrocket / Nekoray 等，base64）</label>' +
 '<a class="code" id="subA" href="' + subURL + '">' + subURL + '</a>' +
+'<div class="qrbar"><button class="ghost" onclick="copyTo(\'' + subURL + '\',this)">复制通用订阅</button>' +
+'<button class="ghost" onclick="showQr(\'base64\')">📱 显示二维码</button></div>' +
 '<label>Clash / Stash / Mihomo 订阅（YAML）</label>' +
 '<a class="code" id="clashA" href="' + clashURL + '">' + clashURL + '</a>' +
-'<button class="ghost" onclick="copyTo(\'' + subURL + '\',this)">复制通用订阅</button>' +
-'<button class="ghost" onclick="copyTo(\'' + clashURL + '\',this)">复制 Clash 订阅</button>' +
-'<a class="code" style="display:none" id="nodeLink"></a>' +
+'<div class="qrbar"><button class="ghost" onclick="copyTo(\'' + clashURL + '\',this)">复制 Clash 订阅</button>' +
+'<button class="ghost" onclick="showQr(\'clash\')">📱 显示二维码</button></div>' +
+'<label>Sing-box 订阅（JSON，v1.8+ 客户端可直接导入）</label>' +
+'<a class="code" id="singboxA" href="' + singboxURL + '">' + singboxURL + '</a>' +
+'<div class="qrbar"><button class="ghost" onclick="copyTo(\'' + singboxURL + '\',this)">复制 Sing-box 订阅</button>' +
+'<button class="ghost" onclick="showQr(\'singbox\')">📱 显示二维码</button></div>' +
 '<label>一键导入</label>' +
 '<button class="ghost" onclick="location.href=\'v2rayng://install-sub?url=\' + encodeURIComponent(\'' + subURL + '\')">v2rayNG</button>' +
 '<button class="ghost" onclick="location.href=\'shadowrocket://add/sub://\' + encodeURIComponent(\'' + subURL + '\')">Shadowrocket</button>' +
 '<button class="ghost" onclick="location.href=\'clash://install-config?url=\' + encodeURIComponent(\'' + clashURL + '\')">Clash</button>' +
-'<div class="hint">客户端也可直接把通用订阅地址填入「订阅分组」，更新即用；UA 为 Clash 系时自动返回 YAML。</div></div>' +
+'<button class="ghost" onclick="location.href=\'sing-box://import-remote-profile?url=\' + encodeURIComponent(\'' + singboxURL + '\')">Sing-box</button>' +
+'<div class="hint">客户端也可直接把订阅地址填入「订阅分组」，更新即用；UA 为 Clash / Sing-box 系时自动返回对应格式。手机端可点「显示二维码」扫码导入。</div></div>' +
 
 '<div class="card"><h2>[ API 管理 ]</h2>' +
 '<code>GET    ' + base + '/api/ips          查询优选 IP</code>' +
@@ -754,40 +1500,46 @@ async function renderPanel(url, request, cfg, env) {
 '<code>GET/POST ' + base + '/api/config     读取 / 保存全部配置</code></div>' +
 
 '</div>' +
+'<div id="qrModal" class="modal"><div class="modal-box"><button class="modal-x" onclick="hideQr()">✕</button><iframe id="qrFrame" title="订阅二维码"></iframe></div></div>' +
 '<div class="footer">✦ 由 <b style="color:#f0883e">数码解码</b> 出品 · <a href="https://github.com/smzxtv/nebula-decode" target="_blank">GitHub 开源项目</a> ✦</div>' +
-'<script>var BASE="' + base + '/";</script>' + PANEL_TAIL;
+'<script>var BASE=' + JSON.stringify(base + '/') + ';var API_TOKEN=' + JSON.stringify(cfg.apiToken || '') + ';</script>' + PANEL_TAIL;
   return new Response(body, { headers: { 'content-type': 'text/html; charset=utf-8', 'x-powered-by': 'shumajiedu | NEBULA-DECODE' } });
 }
 
 const PANEL_TAIL = '<script>' +
 'function $(id){return document.getElementById(id)}' +
 'function show(id,t){$(id).textContent=t;setTimeout(function(){$(id).textContent=""},4000)}' +
+'function apiHeaders(extra){var h=extra||{};if(API_TOKEN){h["X-API-Token"]=API_TOKEN}return h}' +
 'async function loadCfg(){' +
-'  var r=await fetch(BASE+"api/config"),c=await r.json();' +
+'  var r=await fetch(BASE+"api/config",{headers:apiHeaders()}),c=await r.json();' +
 '  $("uuid").value=c.uuid;$("path").value=(c.path||"").replace(/^\\//,"");$("proxyIP").value=c.proxyIP||"";' +
-'  $("trojanPassword").value=c.trojanPassword||"";$("enableVless").checked=!!c.enableVless;' +
-'  $("enableTrojan").checked=!!c.enableTrojan;$("preferredDomains").value=(c.preferredDomains||[]).join(",");' +
-'  var r2=await fetch(BASE+"api/ips"),c2=await r2.json();$("ips").value=(c2.ips||[]).join("\\n");' +
+'  $("trojanPassword").value=c.trojanPassword||"";$("apiToken").value=c.apiToken||"";$("enableVless").checked=!!c.enableVless;' +
+'  $("enableTrojan").checked=!!c.enableTrojan;$("useBuiltinPool").checked=c.useBuiltinPool!==false;$("preferredDomains").value=(c.preferredDomains||[]).join(",");' +
+'  var r2=await fetch(BASE+"api/ips",{headers:apiHeaders()}),c2=await r2.json();$("ips").value=(c2.ips||[]).join("\\n");' +
 '}' +
 'async function saveCfg(){' +
 '  var body={uuid:$("uuid").value.trim(),path:$("path").value.trim(),proxyIP:$("proxyIP").value.trim(),' +
-'    trojanPassword:$("trojanPassword").value.trim(),enableVless:$("enableVless").checked,' +
-'    enableTrojan:$("enableTrojan").checked,preferredDomains:$("preferredDomains").value.split(",").map(function(s){return s.trim()}).filter(Boolean)};' +
-'  var r=await fetch(BASE+"api/config",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});' +
+'    trojanPassword:$("trojanPassword").value.trim(),apiToken:$("apiToken").value.trim(),enableVless:$("enableVless").checked,' +
+'    enableTrojan:$("enableTrojan").checked,useBuiltinPool:$("useBuiltinPool").checked,preferredDomains:$("preferredDomains").value.split(",").map(function(s){return s.trim()}).filter(Boolean)};' +
+'  var r=await fetch(BASE+"api/config",{method:"POST",headers:apiHeaders({"content-type":"application/json"}),body:JSON.stringify(body)});' +
 '  var c=await r.json();if(!c.ok){show("msg1","保存失败: "+(c.error||"未知错误"));return}' +
 '  show("msg1","已保存，即将跳转到新入口...");' +
 '  var base=body.path?"/"+body.path.replace(/^\\/+|\\/+$/g,""):"/"+body.uuid;' +
 '  setTimeout(function(){location.href=base+"/"},800);' +
 '}' +
 'async function addIps(){' +
-'  var r=await fetch(BASE+"api/ips",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({text:$("ips").value})});' +
+'  var r=await fetch(BASE+"api/ips",{method:"POST",headers:apiHeaders({"content-type":"application/json"}),body:JSON.stringify({text:$("ips").value})});' +
 '  var c=await r.json();if(c.ok){$("ips").value=c.ips.join("\\n");show("msg2","已添加 "+c.ips.length+" 条")}else show("msg2","失败: "+c.error);' +
 '}' +
 'async function clearIps(){' +
-'  var r=await fetch(BASE+"api/ips",{method:"DELETE"});var c=await r.json();if(c.ok){$("ips").value="";show("msg2","已清空")}' +
+'  var r=await fetch(BASE+"api/ips",{method:"DELETE",headers:apiHeaders()});var c=await r.json();if(c.ok){$("ips").value="";show("msg2","已清空")}' +
 '}' +
 'function copyTo(t,btn){navigator.clipboard.writeText(t).then(function(){btn.textContent="已复制";setTimeout(function(){btn.textContent=btn.textContent.replace("已复制","复制")},1500)})}' +
 'function genUuid(){if(window.crypto&&crypto.randomUUID){$("uuid").value=crypto.randomUUID()}else{var s="0123456789abcdef",u="";for(var j=0;j<36;j++){u+=(j===8||j===12||j===16||j===20)?"-":(j===14)?"4":s.charAt(Math.floor(Math.random()*16))}$("uuid").value=u}}' +
+'function genToken(){var a=new Uint8Array(16);if(window.crypto&&crypto.getRandomValues){crypto.getRandomValues(a)}else{for(var i=0;i<a.length;i++){a[i]=Math.floor(Math.random()*256)}}var s="";for(var j=0;j<a.length;j++){s+=("0"+a[j].toString(16)).slice(-2)}$("apiToken").value=s}' +
+'function showQr(t){$("qrFrame").src=BASE+"qr?t="+t;document.getElementById("qrModal").classList.add("on")}' +
+'function hideQr(){document.getElementById("qrModal").classList.remove("on");$("qrFrame").src="about:blank"}' +
+'document.addEventListener("keydown",function(e){if(e.key==="Escape")hideQr()});' +
 'loadCfg();' +
 '<\/script></body></html>';
 
